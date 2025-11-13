@@ -2,6 +2,7 @@
 let db;
 const DB_NAME = 'sfpDB';
 const DB_VERSION = 24; // ✅ Versión actual de la base de datos
+const MIGRACION_EMPRESA_KEY = 'migracionEmpresaV1'; // Clave para guardar el estado de la migración
 
 // (variable global)
 let idRecordatorioEditando = null;
@@ -412,6 +413,76 @@ function openDB() {
             reject(event.target.error);
         };
     });
+}
+
+/**
+ * Función de migración: Asigna la empresa activa (o la empresa por defecto) a todos los movimientos que no tienen empresaId.
+ * Se ejecuta una sola vez por sesión, gracias al uso de localStorage.
+ */
+async function migrarMovimientosAEmpresa() {
+    // Verificar si ya se ejecutó esta migración en esta sesión
+    if (localStorage.getItem(MIGRACION_EMPRESA_KEY)) {
+        console.log("[MIGRACIÓN] Ya se ejecutó la migración de empresas en esta sesión.");
+        return;
+    }
+
+    try {
+        console.log("[MIGRACIÓN] Iniciando migración de movimientos a empresa...");
+
+        // Obtener la empresa activa
+        let empresaAsignar = getEmpresaActiva();
+
+        // Si no hay empresa activa, usar la empresa por defecto (la primera que encuentre)
+        if (!empresaAsignar) {
+            const empresas = await getAllEmpresas();
+            if (empresas.length > 0) {
+                empresaAsignar = empresas[0];
+                console.log(`[MIGRACIÓN] No hay empresa activa, usando empresa por defecto: ${empresaAsignar.nombre}`);
+            } else {
+                console.warn("[MIGRACIÓN] No hay ninguna empresa registrada. No se puede migrar movimientos.");
+                return;
+            }
+        }
+
+        // Obtener todos los movimientos
+        const movimientos = await getAllEntries(STORES.MOVIMIENTOS);
+
+        // Filtrar movimientos que no tienen empresaId
+        const movimientosSinEmpresa = movimientos.filter(m => m.empresaId === undefined || m.empresaId === null);
+
+        if (movimientosSinEmpresa.length === 0) {
+            console.log("[MIGRACIÓN] No hay movimientos sin empresa para migrar.");
+            localStorage.setItem(MIGRACION_EMPRESA_KEY, 'true'); // Marcar como ejecutada
+            return;
+        }
+
+        console.log(`[MIGRACIÓN] Encontrados ${movimientosSinEmpresa.length} movimientos sin empresa. Asignando a: ${empresaAsignar.nombre}`);
+
+        // Actualizar los movimientos en la base de datos
+        const transaction = db.transaction([STORES.MOVIMIENTOS], 'readwrite');
+        const store = transaction.objectStore(STORES.MOVIMIENTOS);
+
+        for (const movimiento of movimientosSinEmpresa) {
+            movimiento.empresaId = empresaAsignar.id; // Asignar el ID de la empresa
+            await new Promise((resolve, reject) => {
+                const request = store.put(movimiento); // put actualiza el registro
+                request.onsuccess = () => resolve();
+                request.onerror = () => reject(request.error);
+            });
+        }
+
+        console.log(`[MIGRACIÓN] Migración completada. Se asignaron ${movimientosSinEmpresa.length} movimientos a la empresa "${empresaAsignar.nombre}".`);
+
+        // Marcar la migración como ejecutada en esta sesión
+        localStorage.setItem(MIGRACION_EMPRESA_KEY, 'true');
+
+        // Opcional: Mostrar un toast al usuario
+        mostrarToast(`✅ Migración completada: ${movimientosSinEmpresa.length} movimientos asignados a "${empresaAsignar.nombre}"`, 'success');
+
+    } catch (error) {
+        console.error("[MIGRACIÓN] Error durante la migración de movimientos a empresa:", error);
+        mostrarToast('⚠️ Error al migrar movimientos a empresa. Algunos podrían seguir sin empresa.', 'warning');
+    }
 }
 
 // Funciones genéricas para interactuar con la DB con manejo de errores mejorado
@@ -11092,6 +11163,7 @@ document.addEventListener('DOMContentLoaded', async function () {
         // ✅ INICIALIZAR SISTEMA MULTI-EMPRESA
         await cargarEmpresaActiva();
         await crearEmpresaPorDefecto();
+        await migrarMovimientosAEmpresa();
         await renderizarEmpresas();
         await actualizarSelectorEmpresas();
         actualizarSelectorEmpresaActiva();
@@ -11684,4 +11756,3 @@ function mostrarAyudaListadoEmpresas() {
         'Haz clic en Aceptar para continuar.'
     );
 }
-

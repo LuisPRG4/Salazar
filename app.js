@@ -2,7 +2,6 @@
 let db;
 const DB_NAME = 'sfpDB';
 const DB_VERSION = 24; // ✅ Versión actual de la base de datos
-const MIGRACION_EMPRESA_KEY = 'migracionEmpresaV1'; // Clave para guardar el estado de la migración
 
 // (variable global)
 let idRecordatorioEditando = null;
@@ -416,72 +415,71 @@ function openDB() {
 }
 
 /**
- * Función de migración: Asigna la empresa activa (o la empresa por defecto) a todos los movimientos que no tienen empresaId.
- * Se ejecuta una sola vez por sesión, gracias al uso de localStorage.
+ * Función de utilidad: Asigna la empresa activa actual a *todos* los movimientos
+ * que no tienen un empresaId válido (null, undefined, 0).
+ * Útil para corregir datos existentes manualmente.
  */
-async function migrarMovimientosAEmpresa() {
-    // Verificar si ya se ejecutó esta migración en esta sesión
-    if (localStorage.getItem(MIGRACION_EMPRESA_KEY)) {
-        console.log("[MIGRACIÓN] Ya se ejecutó la migración de empresas en esta sesión.");
-        return;
-    }
-
+async function reasignarMovimientosAEmpresaActiva() {
     try {
-        console.log("[MIGRACIÓN] Iniciando migración de movimientos a empresa...");
+        console.log("[REASIGNACIÓN MASIVA] Iniciando...");
 
         // Obtener la empresa activa
-        let empresaAsignar = getEmpresaActiva();
+        const empresaAsignar = getEmpresaActiva();
 
-        // Si no hay empresa activa, usar la empresa por defecto (la primera que encuentre)
         if (!empresaAsignar) {
-            const empresas = await getAllEmpresas();
-            if (empresas.length > 0) {
-                empresaAsignar = empresas[0];
-                console.log(`[MIGRACIÓN] No hay empresa activa, usando empresa por defecto: ${empresaAsignar.nombre}`);
-            } else {
-                console.warn("[MIGRACIÓN] No hay ninguna empresa registrada. No se puede migrar movimientos.");
-                return;
-            }
+            console.warn("[REASIGNACIÓN MASIVA] No hay ninguna empresa activa. No se puede reasignar.");
+            mostrarToast('⚠️ No hay una empresa activa seleccionada. Por favor, selecciona una empresa primero.', 'warning');
+            return;
         }
+
+        console.log(`[REASIGNACIÓN MASIVA] Usando empresa activa: ${empresaAsignar.nombre} (ID: ${empresaAsignar.id})`);
 
         // Obtener todos los movimientos
         const movimientos = await getAllEntries(STORES.MOVIMIENTOS);
 
-        // Filtrar movimientos que no tienen empresaId
-        const movimientosSinEmpresa = movimientos.filter(m => m.empresaId === undefined || m.empresaId === null);
+        // Filtrar movimientos que NO tienen un empresaId válido
+        const movimientosSinEmpresaValida = movimientos.filter(m => !m.empresaId || m.empresaId === 0);
+        // Opcional: Filtrar también los que tengan un ID de empresa que no exista
+        const todasLasEmpresas = await getAllEmpresas();
+        const idsEmpresasExistentes = new Set(todasLasEmpresas.map(e => e.id));
+        const movimientosConEmpresaInvalida = movimientos.filter(m => m.empresaId && !idsEmpresasExistentes.has(m.empresaId));
+        const movimientosAReasignar = [...new Set([...movimientosSinEmpresaValida, ...movimientosConEmpresaInvalida])]; // Unión y eliminación de duplicados
 
-        if (movimientosSinEmpresa.length === 0) {
-            console.log("[MIGRACIÓN] No hay movimientos sin empresa para migrar.");
-            localStorage.setItem(MIGRACION_EMPRESA_KEY, 'true'); // Marcar como ejecutada
+        if (movimientosAReasignar.length === 0) {
+            console.log("[REASIGNACIÓN MASIVA] No hay movimientos para reasignar.");
+            mostrarToast('✅ No hay movimientos sin empresa o con empresa inválida para reasignar.', 'info');
             return;
         }
 
-        console.log(`[MIGRACIÓN] Encontrados ${movimientosSinEmpresa.length} movimientos sin empresa. Asignando a: ${empresaAsignar.nombre}`);
+        console.log(`[REASIGNACIÓN MASIVA] Encontrados ${movimientosAReasignar.length} movimientos para reasignar.`);
 
         // Actualizar los movimientos en la base de datos
         const transaction = db.transaction([STORES.MOVIMIENTOS], 'readwrite');
         const store = transaction.objectStore(STORES.MOVIMIENTOS);
 
-        for (const movimiento of movimientosSinEmpresa) {
-            movimiento.empresaId = empresaAsignar.id; // Asignar el ID de la empresa
-            await new Promise((resolve, reject) => {
-                const request = store.put(movimiento); // put actualiza el registro
-                request.onsuccess = () => resolve();
-                request.onerror = () => reject(request.error);
-            });
+        let contador = 0;
+        for (const movimiento of movimientosAReasignar) {
+            // Verificar si el ID de empresa es inválido o no existe, o es nulo/undefined
+            if (!movimiento.empresaId || movimiento.empresaId === 0 || !idsEmpresasExistentes.has(movimiento.empresaId)) {
+                movimiento.empresaId = empresaAsignar.id; // Asignar el ID de la empresa activa
+                await new Promise((resolve, reject) => {
+                    const request = store.put(movimiento); // put actualiza el registro
+                    request.onsuccess = () => resolve();
+                    request.onerror = () => reject(request.error);
+                });
+                contador++;
+            }
         }
 
-        console.log(`[MIGRACIÓN] Migración completada. Se asignaron ${movimientosSinEmpresa.length} movimientos a la empresa "${empresaAsignar.nombre}".`);
+        console.log(`[REASIGNACIÓN MASIVA] Reasignación completada. Se actualizaron ${contador} movimientos.`);
+        mostrarToast(`✅ Reasignación completada: ${contador} movimientos asignados a "${empresaAsignar.nombre}"`, 'success');
 
-        // Marcar la migración como ejecutada en esta sesión
-        localStorage.setItem(MIGRACION_EMPRESA_KEY, 'true');
-
-        // Opcional: Mostrar un toast al usuario
-        mostrarToast(`✅ Migración completada: ${movimientosSinEmpresa.length} movimientos asignados a "${empresaAsignar.nombre}"`, 'success');
+        // Opcional: Volver a renderizar la lista de movimientos para reflejar el cambio inmediatamente
+        await renderizar();
 
     } catch (error) {
-        console.error("[MIGRACIÓN] Error durante la migración de movimientos a empresa:", error);
-        mostrarToast('⚠️ Error al migrar movimientos a empresa. Algunos podrían seguir sin empresa.', 'warning');
+        console.error("[REASIGNACIÓN MASIVA] Error durante la reasignación de movimientos:", error);
+        mostrarToast('❌ Error al reasignar movimientos. Revisa la consola.', 'danger');
     }
 }
 
@@ -11163,7 +11161,6 @@ document.addEventListener('DOMContentLoaded', async function () {
         // ✅ INICIALIZAR SISTEMA MULTI-EMPRESA
         await cargarEmpresaActiva();
         await crearEmpresaPorDefecto();
-        await migrarMovimientosAEmpresa();
         await renderizarEmpresas();
         await actualizarSelectorEmpresas();
         actualizarSelectorEmpresaActiva();
